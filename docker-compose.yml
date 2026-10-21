@@ -8,7 +8,7 @@ services:
       # Optional. Without a key everything works except the AI analyst tabs.
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      LLM_MODEL: ${LLM_MODEL:-gemini-2.5-flash}
+      LLM_MODEL: ${LLM_MODEL:-gemini-3.8-flash}
       LLM_MAX_STEPS: ${LLM_MAX_STEPS:-8}
     volumes:
       - backend_reports:/app/reports_output
