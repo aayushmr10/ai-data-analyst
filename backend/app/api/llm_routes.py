@@ -53,15 +53,29 @@ def _call(fn, *args):
         raise
     except Exception as e:  # noqa: BLE001
         name = type(e).__name__
+        code = getattr(e, "code", None) or getattr(e, "status_code", None)
+        text = str(e)
+        low = text.lower()
+        # ---- Google Gemini (google.genai.errors.ClientError / ServerError) ----
+        if code in (401, 403) or "api key not valid" in low or "api_key_invalid" in low or "permission_denied" in low:
+            raise HTTPException(401, "The AI API key was rejected. Check GEMINI_API_KEY (or ANTHROPIC_API_KEY) on your "
+                                     "server (Render > Environment) and redeploy.")
+        if code == 429 or "resource_exhausted" in low or name == "RateLimitError":
+            raise HTTPException(429, "The Gemini API quota/rate limit was hit (free tier allows only a few requests "
+                                     "per minute). Wait a minute and try again, or enable billing on the key.")
+        if code == 404 or "not found" in low and "model" in low:
+            raise HTTPException(502, f"Gemini model '{config.model_name()}' was not found. Set LLM_MODEL "
+                                     "(e.g. gemini-3.8-flash) on your server.")
+        if code in (500, 502, 503, 504) or name in ("ServerError", "InternalServerError"):
+            raise HTTPException(503, "The Gemini service is busy or overloaded. Try again in a moment.")
+        if code == 400 or name in ("ClientError", "BadRequestError", "APIStatusError"):
+            raise HTTPException(502, f"The AI provider rejected the request: {text[:300]}")
         if name == "AuthenticationError":
-            raise HTTPException(401, "The Anthropic API key was rejected. Check ANTHROPIC_API_KEY.")
-        if name == "RateLimitError":
-            raise HTTPException(429, "The AI provider is rate-limiting requests. Try again shortly.")
-        if name in ("APIConnectionError", "APITimeoutError"):
+            raise HTTPException(401, "The AI API key was rejected. Check GEMINI_API_KEY (or ANTHROPIC_API_KEY).")
+        if name in ("APIConnectionError", "APITimeoutError", "ConnectError", "ReadTimeout", "TimeoutException"):
             raise HTTPException(504, "Could not reach the AI provider. Try again.")
-        if name in ("APIStatusError", "BadRequestError", "NotFoundError", "InternalServerError"):
-            raise HTTPException(502, f"The AI provider returned an error ({name}). Check LLM_MODEL and your key.")
-        raise
+        # Never leak a bare 500: a 500 skips CORS headers and the browser shows only "Something went wrong".
+        raise HTTPException(500, f"AI analysis failed ({name}): {text[:300]}")
 
 
 def _fingerprint(session) -> str:
