@@ -3,6 +3,9 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import os
+import re
+import threading
 import time
 from types import SimpleNamespace
 from google import genai
@@ -12,7 +15,32 @@ from google.genai import types
 # Gemini 2.5 "thinking" tokens count against max_output_tokens; without headroom the reply can come
 # back empty (finish_reason=MAX_TOKENS). Retry transient errors (429 rate limit / 5xx overload).
 THINKING_HEADROOM = 4096
-RETRY_DELAYS = (3, 8, 20)
+RETRY_DELAYS = (5, 15, 30)
+
+# Free-tier Gemini keys allow only a handful of requests per minute, and one briefing makes ~10 calls.
+# Space the calls out (seconds between calls; LLM_MIN_INTERVAL_SEC=0 disables) so we stay under the limit.
+_throttle_lock = threading.Lock()
+_last_call = [0.0]
+
+
+def _throttle() -> None:
+    try:
+        gap = float(os.getenv("LLM_MIN_INTERVAL_SEC", "6"))
+    except ValueError:
+        gap = 6.0
+    if gap <= 0:
+        return
+    with _throttle_lock:
+        wait = _last_call[0] + gap - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call[0] = time.monotonic()
+
+
+def _retry_wait(err, default: float) -> float:
+    """Use the delay Gemini asks for ('retry in 26s' / retryDelay) when it gives one."""
+    m = re.search(r"retry(?: in|Delay['\": ]+)\s*([\d.]+)\s*s", str(err), re.I)
+    return min(float(m.group(1)) + 1, 60.0) if m else default
 
 class GeminiMessages:
     def __init__(self, api_key: str, timeout: float = 90.0, max_retries: int = 2):
@@ -69,12 +97,14 @@ class GeminiMessages:
         response = None
         for attempt in range(len(RETRY_DELAYS) + 1):
             try:
+                _throttle()
                 response = self.client.models.generate_content(model=model, contents=contents, config=config)
                 break
             except genai_errors.APIError as e:
                 code = getattr(e, 'code', None)
-                if code in (429, 500, 502, 503, 504) and attempt < len(RETRY_DELAYS):
-                    time.sleep(RETRY_DELAYS[attempt])
+                daily = 'perday' in str(e).lower().replace('_', '').replace(' ', '')
+                if code in (429, 500, 502, 503, 504) and attempt < len(RETRY_DELAYS) and not daily:
+                    time.sleep(_retry_wait(e, RETRY_DELAYS[attempt]))
                     continue
                 raise
         blocks=[]
