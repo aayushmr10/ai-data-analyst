@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+dist/
+*.log
+.DS_Store
+backend/reports_output/*.pdf
+backend/datasets/*
+!backend/datasets/.gitkeep
+
+.env
+.pytest_cache/
