@@ -52,7 +52,29 @@ async def reject_oversized_uploads(request, call_next):
     return await call_next(request)
 
 
+def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Repair column names damaged by a byte-order-mark (e.g. 'ï»¿Year' or 'Ã¯Â»Â¿Year' -> 'Year')."""
+    def fix(c):
+        if not isinstance(c, str):
+            return c
+        for _ in range(3):  # undo up to three rounds of UTF-8 text mis-read as latin-1
+            try:
+                fixed = c.encode("latin-1").decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                break
+            if fixed == c:
+                break
+            c = fixed
+        return c.replace("\ufeff", "").strip()
+    df.columns = [fix(c) for c in df.columns]
+    return df
+
+
 def _read_upload(filename: str, content: bytes) -> pd.DataFrame:
+    return _clean_columns(_read_upload_raw(filename, content))
+
+
+def _read_upload_raw(filename: str, content: bytes) -> pd.DataFrame:
     lower = filename.lower()
     buf = io.BytesIO(content)
     try:
