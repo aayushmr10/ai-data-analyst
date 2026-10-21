@@ -1,5 +1,7 @@
 """Small Anthropic-message API compatibility layer backed by Google's Gemini SDK."""
 from __future__ import annotations
+import base64
+import binascii
 import json
 import time
 from types import SimpleNamespace
@@ -17,6 +19,19 @@ class GeminiMessages:
         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout * 1000))
         self.call_names = {}
         self.raw_parts = {}  # call_id -> original Gemini part (keeps the thought_signature Gemini 3 requires)
+    @staticmethod
+    def _replayable(part):
+        """Copy of a function-call part safe to send back. The SDK hands thought_signature over still
+        base64-encoded and then base64-encodes it again on the way out, which Gemini 3 rejects as
+        'Corrupted thought signature'. Decode once here so the round trip is exact."""
+        sig = getattr(part, 'thought_signature', None)
+        if isinstance(sig, (bytes, bytearray)) and sig:
+            try:
+                sig = base64.b64decode(bytes(sig), validate=True)
+            except (binascii.Error, ValueError):
+                pass
+        return types.Part(function_call=part.function_call, thought_signature=sig or None)
+
     def create(self, *, model, max_tokens, system, tools, messages, tool_choice=None):
         declarations = []
         for t in tools:
@@ -72,7 +87,7 @@ class GeminiMessages:
                     # Agent expects a unique id, though execution is local and deterministic.
                     call_id=f'gemini-{len(self.call_names)}'
                     self.call_names[call_id]=fc.name
-                    self.raw_parts[call_id]=part
+                    self.raw_parts[call_id]=self._replayable(part)
                     blocks.append(SimpleNamespace(type='tool_use', id=call_id, name=fc.name, input=dict(fc.args or {})))
         usage=response.usage_metadata
         return SimpleNamespace(content=blocks, usage=SimpleNamespace(input_tokens=getattr(usage,'prompt_token_count',0) or 0, output_tokens=getattr(usage,'candidates_token_count',0) or 0))
