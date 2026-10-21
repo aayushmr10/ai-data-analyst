@@ -1,1 +1,122 @@
-
+diff --git a/backend/app/api/llm_routes.py b/backend/app/api/llm_routes.py
+index 2ad97ec..12449e7 100644
+--- a/backend/app/api/llm_routes.py
++++ b/backend/app/api/llm_routes.py
+@@ -53,15 +53,29 @@ def _call(fn, *args):
+         raise
+     except Exception as e:  # noqa: BLE001
+         name = type(e).__name__
++        code = getattr(e, "code", None) or getattr(e, "status_code", None)
++        text = str(e)
++        low = text.lower()
++        # ---- Google Gemini (google.genai.errors.ClientError / ServerError) ----
++        if code in (401, 403) or "api key not valid" in low or "api_key_invalid" in low or "permission_denied" in low:
++            raise HTTPException(401, "The AI API key was rejected. Check GEMINI_API_KEY (or ANTHROPIC_API_KEY) on your "
++                                     "server (Render > Environment) and redeploy.")
++        if code == 429 or "resource_exhausted" in low or name == "RateLimitError":
++            raise HTTPException(429, "The Gemini API quota/rate limit was hit (free tier allows only a few requests "
++                                     "per minute). Wait a minute and try again, or enable billing on the key.")
++        if code == 404 or "not found" in low and "model" in low:
++            raise HTTPException(502, f"Gemini model '{config.model_name()}' was not found. Set LLM_MODEL "
++                                     "(e.g. gemini-2.5-flash) on your server.")
++        if code in (500, 502, 503, 504) or name in ("ServerError", "InternalServerError"):
++            raise HTTPException(503, "The Gemini service is busy or overloaded. Try again in a moment.")
++        if code == 400 or name in ("ClientError", "BadRequestError", "APIStatusError"):
++            raise HTTPException(502, f"The AI provider rejected the request: {text[:300]}")
+         if name == "AuthenticationError":
+-            raise HTTPException(401, "The Anthropic API key was rejected. Check ANTHROPIC_API_KEY.")
+-        if name == "RateLimitError":
+-            raise HTTPException(429, "The AI provider is rate-limiting requests. Try again shortly.")
+-        if name in ("APIConnectionError", "APITimeoutError"):
++            raise HTTPException(401, "The AI API key was rejected. Check GEMINI_API_KEY (or ANTHROPIC_API_KEY).")
++        if name in ("APIConnectionError", "APITimeoutError", "ConnectError", "ReadTimeout", "TimeoutException"):
+             raise HTTPException(504, "Could not reach the AI provider. Try again.")
+-        if name in ("APIStatusError", "BadRequestError", "NotFoundError", "InternalServerError"):
+-            raise HTTPException(502, f"The AI provider returned an error ({name}). Check LLM_MODEL and your key.")
+-        raise
++        # Never leak a bare 500: a 500 skips CORS headers and the browser shows only "Something went wrong".
++        raise HTTPException(500, f"AI analysis failed ({name}): {text[:300]}")
+ 
+ 
+ def _fingerprint(session) -> str:
+diff --git a/backend/app/llm/gemini_compat.py b/backend/app/llm/gemini_compat.py
+index b8f3902..8068e7f 100644
+--- a/backend/app/llm/gemini_compat.py
++++ b/backend/app/llm/gemini_compat.py
+@@ -1,10 +1,17 @@
+ """Small Anthropic-message API compatibility layer backed by Google's Gemini SDK."""
+ from __future__ import annotations
+ import json
++import time
+ from types import SimpleNamespace
+ from google import genai
++from google.genai import errors as genai_errors
+ from google.genai import types
+ 
++# Gemini 2.5 "thinking" tokens count against max_output_tokens; without headroom the reply can come
++# back empty (finish_reason=MAX_TOKENS). Retry transient errors (429 rate limit / 5xx overload).
++THINKING_HEADROOM = 4096
++RETRY_DELAYS = (3, 8, 20)
++
+ class GeminiMessages:
+     def __init__(self, api_key: str, timeout: float = 90.0, max_retries: int = 2):
+         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout * 1000))
+@@ -35,13 +42,24 @@ class GeminiMessages:
+                             parts.append(types.Part.from_function_response(name=self.call_names.get(block.get('tool_use_id'), 'unknown_tool'), response={'result': block.get('content','')}))
+                         elif block.get('type') == 'text': parts.append(types.Part.from_text(text=block.get('text','')))
+                     if parts: contents.append(types.Content(role='user', parts=parts))
+-        config = types.GenerateContentConfig(system_instruction=system, max_output_tokens=max_tokens, tools=gem_tools, temperature=0.2)
++        config = types.GenerateContentConfig(system_instruction=system, max_output_tokens=max_tokens + THINKING_HEADROOM, tools=gem_tools, temperature=0.2)
+         if tool_choice and tool_choice.get('type') == 'tool':
+             config.tool_config = types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode='ANY', allowed_function_names=[tool_choice['name']]))
+-        response = self.client.models.generate_content(model=model, contents=contents, config=config)
++        response = None
++        for attempt in range(len(RETRY_DELAYS) + 1):
++            try:
++                response = self.client.models.generate_content(model=model, contents=contents, config=config)
++                break
++            except genai_errors.APIError as e:
++                code = getattr(e, 'code', None)
++                if code in (429, 500, 502, 503, 504) and attempt < len(RETRY_DELAYS):
++                    time.sleep(RETRY_DELAYS[attempt])
++                    continue
++                raise
+         blocks=[]
+         for cand in (response.candidates or []):
+-            for part in (cand.content.parts or []):
++            content = getattr(cand, 'content', None)
++            for part in (getattr(content, 'parts', None) or []):
+                 if getattr(part,'text',None): blocks.append(SimpleNamespace(type='text', text=part.text))
+                 fc=getattr(part,'function_call',None)
+                 if fc and fc.name:
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 44f50fe..063f45b 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -52,7 +52,26 @@ async def reject_oversized_uploads(request, call_next):
+     return await call_next(request)
+ 
+ 
++_BOM_JUNK = ("\ufeff", "\u00ef\u00bb\u00bf", "\u00c3\u00af\u00c2\u00bb\u00c2\u00bf")  # BOM and its mojibake forms
++
++
++def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
++    """Strip a stray byte-order-mark (shows up as 'ï»¿Year') from column names."""
++    def fix(c):
++        if isinstance(c, str):
++            for junk in _BOM_JUNK:
++                c = c.replace(junk, "")
++            return c.strip()
++        return c
++    df.columns = [fix(c) for c in df.columns]
++    return df
++
++
+ def _read_upload(filename: str, content: bytes) -> pd.DataFrame:
++    return _clean_columns(_read_upload_raw(filename, content))
++
++
++def _read_upload_raw(filename: str, content: bytes) -> pd.DataFrame:
+     lower = filename.lower()
+     buf = io.BytesIO(content)
+     try:
