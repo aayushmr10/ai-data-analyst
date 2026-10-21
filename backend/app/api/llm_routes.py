@@ -60,6 +60,9 @@ def _call(fn, *args):
         if code in (401, 403) or "api key not valid" in low or "api_key_invalid" in low or "permission_denied" in low:
             raise HTTPException(401, "The AI API key was rejected. Check GEMINI_API_KEY (or ANTHROPIC_API_KEY) on your "
                                      "server (Render > Environment) and redeploy.")
+        if (code == 429 or "resource_exhausted" in low) and "perday" in low.replace("_", "").replace(" ", ""):
+            raise HTTPException(429, "Your Gemini key has used up its DAILY free quota for this model. Try again "
+                                     "tomorrow, enable billing in Google AI Studio, or set LLM_MODEL to another model.")
         if code == 429 or "resource_exhausted" in low or name == "RateLimitError":
             raise HTTPException(429, "The Gemini API quota/rate limit was hit (free tier allows only a few requests "
                                      "per minute). Wait a minute and try again, or enable billing on the key.")
